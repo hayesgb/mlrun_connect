@@ -20,7 +20,7 @@ from mlrun import get_run_db
 import v3io_frames as v3f
 
 
-class AzureSBToMlrun:
+class AzureSBToMLRun:
     """
     Listen in the background for messages on a Azure Service Bus Queue
     (like Nuclio).  If a message is received, parse the message and 
@@ -75,6 +75,20 @@ class AzureSBToMlrun:
         An Azure Service Bus Queue Connection String
     queue_name
         The queue on which to listen
+    tenant_id
+        The Azure tenant where your Service Bus resides
+    client_id
+        The Azure client_id for a ServicePrincipal
+    client_secret
+        The secret for your Azure Service Principal
+    credential
+        Any credential that can be provided to Azure for authentication
+    connection_string
+        An Azure connection string for your Service Bus
+    mlrun_project
+        This is the name of the mlrun project that will be run
+        By default this is pulled from environmental variables.  Otherwise
+        input will be taken from here, or be designated as "default"
 
     Users can authenticate to the Service Bus using a connection string and
     queue_name, or using a ClientSecretCredential, which requires also

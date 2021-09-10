@@ -12,11 +12,11 @@ setup(
     url="https://github.com/hayesgb/mlrun_connect/",
     classifiers=[
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: Apache 2.0",
-        "Operating System :: Linux",
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
+        "Topic :: Scientific/Engineering",
     ],
     maintainer="Greg Hayes",
     license="Apache 2.0",

@@ -1,0 +1,2 @@
+include versioneer.py
+include mlrun_connect/_version.py

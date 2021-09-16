@@ -1,5 +1,6 @@
 # Custom additions
 *.ipynb
+test_print/**
 
 
 # Byte-compiled / optimized / DLL files

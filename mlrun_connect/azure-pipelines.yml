@@ -1,0 +1,48 @@
+trigger:
+  branches:
+    include:
+    - master
+    - refs/tags/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+jobs:
+  - job: Lint
+    steps:
+      - bash: echo "##vso[task.prependpath]$CONDA/bin"
+        displayName: Add conda to PATH
+
+      - script: |
+          conda install -y -c conda-forge python=3 pre-commit
+          pre-commit install --install-hooks
+        displayName: 'Install dependencies'
+
+      - script: |
+          pre-commit run --all-files --show-diff-on-failure
+        displayName: 'Lint'
+
+  - job: Test
+    steps:
+      - bash: echo "##vso[task.prependpath]$CONDA/bin"
+        displayName: Add conda to PATH
+
+      - script: |
+          conda install -y -c conda-forge python=3 pre-commit
+          pip install -r requirements.txt
+        displayName: 'Install dependencies'
+
+      - script: |
+          pytest mlrun_connect/tests --junitxml=junit/test-results.xml --cov=. --cov-report=xml
+        displayName: 'Run Tests'
+
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFiles: '**/test-*.xml'
+          testRunTitle: 'Publish test results for Python requirements.txt'
+
+      - task: PublishCodeCoverageResults@1
+        inputs:
+          codeCoverageTool: Cobertura
+          summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'

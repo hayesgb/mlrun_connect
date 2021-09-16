@@ -29,7 +29,6 @@ setup(
         "azure-identity",
         "azure-servicebus>=7.3.2",
         "mlrun",
-        "pandas",
         "v3io_frames",
     ],
     tests_require=["pytest"],

@@ -1,0 +1,7 @@
+azure-identity
+azure-servicebus>=7.3.2
+black
+flake8
+mlrun
+pytest
+v3io_frames

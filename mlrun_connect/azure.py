@@ -23,7 +23,7 @@ import v3io.dataplane
 class AzureSBToMLRun:
     """
     Listen in the background for messages on a Azure Service Bus Queue
-    (like Nuclio).  If a message is received, parse the message and 
+    (like Nuclio).  If a message is received, parse the message and
     use it to start a Kubeflow Pipeline.
     The current design expects to receive a message that was sent to the
     Queue from Azure Event Grid.
@@ -141,8 +141,7 @@ class AzureSBToMLRun:
         self.v3io_client = v3io.dataplane.Client(max_connections=1)
         self.tbl_init()
         self._listener_thread = Thread(target=self.do_connect, daemon=True)
-        self._listener_thread.start()      
-
+        self._listener_thread.start()
 
     def _get_credential_from_service_principal(self):
         """
@@ -157,7 +156,7 @@ class AzureSBToMLRun:
         return credential
 
     def do_connect(self):
-        """ Create a connection to service bus"""
+        """Create a connection to service bus"""
         logging.info("do_connect")
         while True:
             if self.connection_string is not None:
@@ -171,37 +170,44 @@ class AzureSBToMLRun:
                 raise ValueError("Unable to create connection to Service Bus!")
             self.get_servicebus_receiver()
 
-    def tbl_init(self, overwrite = False):
+    def tbl_init(self, overwrite=False):
         """
         If it doesn't exist, create the v3io table and k,v schema
-        
-        :param overwrite: Manually overwrite the 
+
+        :param overwrite: Manually overwrite the
         """
 
-        if (not Path("/v3io", self.v3io_container, self.table).exists()) or (overwrite is True):
+        if (not Path("/v3io", self.v3io_container, self.table).exists()) or (
+            overwrite is True
+        ):
             logging.info("Creating table.")
             self.v3io_client.create_schema(
-            container = self.v3io_container,
-            path =self.table,
-            key = "message_id",
-            fields=[
-                {"name": "message_id", "type": "string", "nullable": False},
-                {"name": "message_topic", "type": "string", "nullable": True},
-                {"name": "event_type", "type": "string", "nullable": True},
-                {"name": "event_time", "type": "timestamp", "nullable": True},
-                {"name": "blob_url", "type": "string", "nullable": True},
-                {"name": "workflow_id", "type": "string", "nullable": True},
-                {"name": "run_status", "type": "string", "nullable": True},
-                {"name": "run_attempts", "type": "long", "nullable": False},
-                {"name": "abfs_account_name", "type": "string", "nullable": True},
-                {"name": "abfs_path", "type": "string", "nullable": True},
-                {"name": "run_start_timestamp", "type": "timestamp", "nullable": True},
-                ])
+                container=self.v3io_container,
+                path=self.table,
+                key="message_id",
+                fields=[
+                    {"name": "message_id", "type": "string", "nullable": False},
+                    {"name": "message_topic", "type": "string", "nullable": True},
+                    {"name": "event_type", "type": "string", "nullable": True},
+                    {"name": "event_time", "type": "timestamp", "nullable": True},
+                    {"name": "blob_url", "type": "string", "nullable": True},
+                    {"name": "workflow_id", "type": "string", "nullable": True},
+                    {"name": "run_status", "type": "string", "nullable": True},
+                    {"name": "run_attempts", "type": "long", "nullable": False},
+                    {"name": "abfs_account_name", "type": "string", "nullable": True},
+                    {"name": "abfs_path", "type": "string", "nullable": True},
+                    {
+                        "name": "run_start_timestamp",
+                        "type": "timestamp",
+                        "nullable": True,
+                    },
+                ],
+            )
         else:
             logging.info("table already exists.  Do not recreate")
 
     def get_servicebus_receiver(self):
-        """ Construct the service bus receiver """
+        """Construct the service bus receiver"""
         with self.sb_client as client:
             receiver = client.get_queue_receiver(queue_name=self.servicebus_queue_name)
             self.receive_messages(receiver)
@@ -261,18 +267,18 @@ class AzureSBToMLRun:
         Check to see if an entry with the specified Azure Service Bus
         If the message_id is present, return True, and the attributes
         from the key-value store
-        
+
         :param message_id: The message to be interrogated
         :returns A tuple of True/False and if True, the k,v run status
             from the table
-        
+
         """
         query = f"message_id == '{message_id}'"
         logging.info(f"is message_id:  {message_id} in kv store?")
         response = self.v3io_client.kv.scan(
             container=self.v3io_container,
             table_path=self.table,
-            filter_expression = query,
+            filter_expression=query,
         )
         items = response.output.items
 
@@ -287,34 +293,35 @@ class AzureSBToMLRun:
             raise ValueError("Found duplicate entries by message_id in k,v store!")
 
     def update_kv_data(self, message, action=None):
-        """ Add the Service Bus message to the kv table"""
+        """Add the Service Bus message to the kv table"""
 
         try:
             if action in ["create_entry", "update_entry", "delete_entry"]:
                 if action == "create_entry":
                     logging.info("Adding record")
                     for item_key, item_attributes in message.items():
-                        self.v3io_client.kv.put(container=self.v3io_container,
-                                                table_path = self.table,
-                                                key = item_key,
-                                                attributes = item_attributes
-                                               )
+                        self.v3io_client.kv.put(
+                            container=self.v3io_container,
+                            table_path=self.table,
+                            key=item_key,
+                            attributes=item_attributes,
+                        )
                 elif action == "update_entry":
                     logging.info("Updating record")
                     for item_key, item_attributes in message.items():
                         self.v3io_client.kv.update(
-                            container = self.v3io_container,
+                            container=self.v3io_container,
                             table_path=self.table,
-                            key = item_key,
-                            attributes = item_attributes
+                            key=item_key,
+                            attributes=item_attributes,
                         )
                 elif action == "delete_entry":
                     logging.info("Removing record")
                     for item_key, item_attributes in message.items():
                         self.v3io_client.kv.delete(
-                        container = self.v3io_container,
-                        table_path = self.table,
-                        key = item_key,
+                            container=self.v3io_container,
+                            table_path=self.table,
+                            key=item_key,
                         )
                 else:
                     raise ValueError("Value passed to update_kv_data unknown!")
@@ -358,11 +365,12 @@ class AzureSBToMLRun:
         query = "run_status in ('Started', 'Running')"
 
         response = self.v3io_client.kv.scan(
-            container=self.v3io_container, table_path=self.table, filter_expression=query
+            container=self.v3io_container,
+            table_path=self.table,
+            filter_expression=query,
         )
         items = response.output.items
         return len(items)
-        
 
     def get_run_status(self, workflow_id):
         """
@@ -375,13 +383,15 @@ class AzureSBToMLRun:
             db = get_run_db().connect()
             pipeline_info = db.get_pipeline(run_id=workflow_id)
             run_status = pipeline_info.get("run").get("status") or "none"
-            data = json.loads(pipeline_info.get("pipeline_runtime").get("workflow_manifest"))
+            data = json.loads(
+                pipeline_info.get("pipeline_runtime").get("workflow_manifest")
+            )
             run_start_ts = data.get("status").get("startedAt")
             if run_start_ts is None:
                 run_start_ts = "null"
             else:
                 run_start_ts = datetime.strptime(run_start_ts, "%Y-%m-%dT%H:%M:%SZ")
-            
+
             return run_status, run_start_ts
         except Exception as e:
             raise RuntimeError(f"Failed to get_run_status for {e}")
@@ -402,24 +412,24 @@ class AzureSBToMLRun:
         event_type = message.get("eventType", "none")
         event_time = message.get("eventTime")
         data = message.get("data", "none")
-        if data is not "none":
+        if data != "none":
             blob_url = data.get("blobUrl", "none")
             # Reformat the blob_url to a fsspec-compatible file location
             abfs_account, abfs_path = self._parse_blob_url_to_fsspec_path(blob_url)
 
         processed_message = {
-            message_id: # The messageId from Service Bus
-                {"message_topic": message_topic,  # messageTopic from Service Bus
+            message_id: {  # The messageId from Service Bus
+                "message_topic": message_topic,  # messageTopic from Service Bus
                 "event_type": event_type,  # The eventType from Service Bus
-                 "event_time": event_time, # The eventTime from service Bus
+                "event_time": event_time,  # The eventTime from service Bus
                 "blob_url": blob_url,  # The blobUrl -- The blob created
                 "workflow_id": "none",  # This is the workflow_id set by mlrun
                 "run_status": "none",  # This is the run_status in Iguazio
                 "run_attempts": 0,  # zero-index count the number of run attempts
                 "abfs_account_name": abfs_account or "none",
                 "abfs_path": abfs_path or "none",
-                 "run_start_timestamp": "null",
-                }
+                "run_start_timestamp": "null",
+            }
         }
 
         # Check to see if the message_id is in the nosql run table
@@ -437,7 +447,7 @@ class AzureSBToMLRun:
                 workflow_id = self.run_pipeline(event=processed_message)
                 run_status = "Started"
                 logging.info(f"workflow_id is:  {workflow_id}")
-                if workflow_id is not "none":
+                if workflow_id != "none":
                     # Here we're starting the pipeline and adding the workflow_id
                     # to the kv store
                     logging.info(f"workflow_id is:  {workflow_id}")
@@ -446,22 +456,23 @@ class AzureSBToMLRun:
             self.update_kv_data(processed_message, action="update_entry")
             logging.info("Sleeping")
             time.sleep(20)
-#         else:
-#             logging.info(
-#                 "Found message_id in the kv store.  Check to see if the "
-#                 "pipeline is running or has run"
-#             )
-#             run_status = existing_kv_entry[message_id]["run_status"]
-#             if run_status in ["none", "Failed"]:
-#                 workflow_id = self.run_pipeline(event=existing_kv_entry)
-#                 run_status = "Started"
-#                 existing_kv_entry[message_id]["workflow_id"] = workflow_id
-#                 existing_kv_entry[message_id]["run_status"] = run_status
-#                 self.update_kv_data(existing_kv_entry, action="update_entry")
-#             elif run_status == "Running":
-#                 pass
-#             else:
-#                 logging.info(f"run_status unknown:  {run_status}")
+
+    #         else:
+    #             logging.info(
+    #                 "Found message_id in the kv store.  Check to see if the "
+    #                 "pipeline is running or has run"
+    #             )
+    #             run_status = existing_kv_entry[message_id]["run_status"]
+    #             if run_status in ["none", "Failed"]:
+    #                 workflow_id = self.run_pipeline(event=existing_kv_entry)
+    #                 run_status = "Started"
+    #                 existing_kv_entry[message_id]["workflow_id"] = workflow_id
+    #                 existing_kv_entry[message_id]["run_status"] = run_status
+    #                 self.update_kv_data(existing_kv_entry, action="update_entry")
+    #             elif run_status == "Running":
+    #                 pass
+    #             else:
+    #                 logging.info(f"run_status unknown:  {run_status}")
 
     def check_and_update_run_status(self, ttl: int = 4):
         """
@@ -479,8 +490,7 @@ class AzureSBToMLRun:
         # And calculate the current time, so we can decide how to handle
         # long-running jobs and if we should ignore old runs
         now = datetime.datetime.now(datetime.timezone.utc)
-        ttl = ttl*3600   # Convert hours to seconds
-        
+        ttl = ttl * 3600  # Convert hours to seconds
 
         # Get the count of running pipelines in the KV store
         # as well as the pipelines in KV that are logged as in progress
@@ -488,7 +498,9 @@ class AzureSBToMLRun:
         logging.info(f"How many running pipelines were found:  {num_running_pipelines}")
         try:
             response = self.v3io_client.kv.scan(
-                container=self.v3io_container, table_path=self.table, filter_expression=query
+                container=self.v3io_container,
+                table_path=self.table,
+                filter_expression=query,
             )
             items = response.output.items
             if items:
@@ -498,12 +510,10 @@ class AzureSBToMLRun:
                 for item in items:
                     logging.info(item)
                     new_item = {}
-                    workflow_id = item['workflow_id']
-                    message_id = item.pop('__name')
+                    workflow_id = item["workflow_id"]
+                    message_id = item.pop("__name")
                     new_item[message_id] = item
-                    logging.info(
-                        f"Checking run info for workflow_id:" f"{workflow_id}"
-                    )
+                    logging.info(f"Checking run info for workflow_id:" f"{workflow_id}")
 
                     # Get the latest run status for the workflow_id from the mlrun database
                     # and update it here.
@@ -513,9 +523,9 @@ class AzureSBToMLRun:
                     if run_status == "Succeeded":
                         logging.info("run_status is 'Succeeded'")
                         pass
-                    elif (
-                        run_status in ["Failed", "none"]
-                    ) and (num_running_pipelines <= self.max_concurrent_pipelines):  # and current_run_info["run_attempts"] < 3:
+                    elif (run_status in ["Failed", "none"]) and (
+                        num_running_pipelines <= self.max_concurrent_pipelines
+                    ):  # and current_run_info["run_attempts"] < 3:
                         logging.info(
                             "Run status in a Failed or none state."
                             "Retry the pipeline!"
@@ -538,14 +548,16 @@ class AzureSBToMLRun:
                                 db = get_run_db.connect()
                                 db.abort_run(workflow_id)
                             except Exception as e:
-                                logging.info("Failed to abort run")
-                        
+                                logging.info(f"Failed to abort run with {e}")
+
                         new_item[message_id]["run_attempts"] += 1
-                        if new_items[message_id]["run_attempts"] <= 3:
+                        if new_item[message_id]["run_attempts"] <= 3:
                             db = get_run_db().connect()
                             pipe = db.get_pipeline(run_id=workflow_id)
-                            pipe = json.loads(pipe['pipeline_runtime']['workflow_manifest'])
-                            uid = pipe['metadata']['uid']
+                            pipe = json.loads(
+                                pipe["pipeline_runtime"]["workflow_manifest"]
+                            )
+                            uid = pipe["metadata"]["uid"]
                             db.abort_run(uid, project=self.project)
 
                     else:
@@ -567,6 +579,3 @@ class AzureSBToMLRun:
         except Exception as e:
             logging.info(f"Caught exception {e}." "Update counter retry!")
             time.sleep(10)
-
-
-        

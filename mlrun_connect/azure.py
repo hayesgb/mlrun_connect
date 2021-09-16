@@ -1,10 +1,10 @@
-import concurrent.futures
+import datetime
 import os
 import json
 import logging
-import pandas as pd
+from pathlib import Path
 import time
-import threading
+from threading import Thread
 from urllib.parse import urlparse
 
 from azure.identity import ClientSecretCredential
@@ -17,7 +17,7 @@ from azure.servicebus.exceptions import (
     MessageNotFoundError,
 )
 from mlrun import get_run_db
-import v3io_frames as v3f
+import v3io.dataplane
 
 
 class AzureSBToMLRun:
@@ -105,6 +105,7 @@ class AzureSBToMLRun:
         client_secret=None,
         credential=None,
         connection_string=None,
+        max_concurrent_pipelines=3,
         mlrun_project=None,
     ):
         self.credential = credential
@@ -125,7 +126,8 @@ class AzureSBToMLRun:
             or os.getenv("AZURE_STORAGE_CLIENT_SECRET")
         )
         self.connection_string = connection_string
-        self.queue_name = queue_name
+        self.max_concurrent_pipelines = max_concurrent_pipelines
+        self.servicebus_queue_name = queue_name
         self.v3io_container = "projects"
         self.project = os.getenv("MLRUN_DEFAULT_PROJECT") or mlrun_project or "default"
         self.table = os.path.join(self.project, "servicebus_table")
@@ -136,12 +138,11 @@ class AzureSBToMLRun:
             and self.client_secret is not None
         ):
             self.credential = self._get_credential_from_service_principal()
-        #         self._tbl_init()
-        self.v3io_client = v3f.Client(
-            address="framesd:8081", container=self.v3io_container
-        )
-        self._listener_thread = threading.Thread(target=self.do_connect, daemon=True)
-        self._listener_thread.start()
+        self.v3io_client = v3io.dataplane.Client(max_connections=1)
+        self.tbl_init()
+        self._listener_thread = Thread(target=self.do_connect, daemon=True)
+        self._listener_thread.start()      
+
 
     def _get_credential_from_service_principal(self):
         """
@@ -157,37 +158,52 @@ class AzureSBToMLRun:
 
     def do_connect(self):
         """ Create a connection to service bus"""
-        if self.connection_string is not None:
-            self.sb_client = ServiceBusClient.from_connection_string(
-                conn_str=self.connection_string
-            )
-        elif self.namespace is not None and self.credential is not None:
-            self.fqns = f"https://{self.namespace}.servicebus.windows.net"
-            self.sb_client = ServiceBusClient(self.fqns, self.credential)
-        else:
-            raise ValueError("Unable to create connection to Service Bus!")
-        self.get_servicebus_receiver()
+        logging.info("do_connect")
+        while True:
+            if self.connection_string is not None:
+                self.sb_client = ServiceBusClient.from_connection_string(
+                    conn_str=self.connection_string
+                )
+            elif self.namespace is not None and self.credential is not None:
+                self.fqns = f"https://{self.namespace}.servicebus.windows.net"
+                self.sb_client = ServiceBusClient(self.fqns, self.credential)
+            else:
+                raise ValueError("Unable to create connection to Service Bus!")
+            self.get_servicebus_receiver()
 
-    #     def _tbl_init(self):
-    #         """ Create the v3io table and it's schema """
-    #     client = v3io.dataplane.Client(max_connections=1)
-    #     client.create_schema(
-    #      container = self.v3io_container,
-    #       path =self.table,
-    #         fields=[
-    #             {"name": "message_id", "type": "string", "nullable": False},
-    #             {"name": "message_topic", "type": "string", "nullable": True},
-    #             {"name": "event_type", "type": "string", "nullable": True},
-    #             {"name": "blob_url", "type": "string", "nullable": True},
-    #             {"name": "workflow_id", "type": "string", "nullable": False},
-    #             {"name": "run_status", "type": "string", "nullable": True},
-    #             {"name": "run_attempts", "type": "long", "nullable": False}
-    #             ])
+    def tbl_init(self, overwrite = False):
+        """
+        If it doesn't exist, create the v3io table and k,v schema
+        
+        :param overwrite: Manually overwrite the 
+        """
+
+        if (not Path("/v3io", self.v3io_container, self.table).exists()) or (overwrite is True):
+            logging.info("Creating table.")
+            self.v3io_client.create_schema(
+            container = self.v3io_container,
+            path =self.table,
+            key = "message_id",
+            fields=[
+                {"name": "message_id", "type": "string", "nullable": False},
+                {"name": "message_topic", "type": "string", "nullable": True},
+                {"name": "event_type", "type": "string", "nullable": True},
+                {"name": "event_time", "type": "timestamp", "nullable": True},
+                {"name": "blob_url", "type": "string", "nullable": True},
+                {"name": "workflow_id", "type": "string", "nullable": True},
+                {"name": "run_status", "type": "string", "nullable": True},
+                {"name": "run_attempts", "type": "long", "nullable": False},
+                {"name": "abfs_account_name", "type": "string", "nullable": True},
+                {"name": "abfs_path", "type": "string", "nullable": True},
+                {"name": "run_start_timestamp", "type": "timestamp", "nullable": True},
+                ])
+        else:
+            logging.info("table already exists.  Do not recreate")
 
     def get_servicebus_receiver(self):
         """ Construct the service bus receiver """
         with self.sb_client as client:
-            receiver = client.get_queue_receiver(queue_name=self.queue_name)
+            receiver = client.get_queue_receiver(queue_name=self.servicebus_queue_name)
             self.receive_messages(receiver)
 
     def receive_messages(self, receiver):
@@ -241,37 +257,68 @@ class AzureSBToMLRun:
                     continue
 
     def check_kv_for_message(self, message_id):
-        """ Check to see if an entry with the specified Azure Service Bus"""
-        logging.info("is message in kv store?")
-        try:
-            df = self.v3io_client.read(backend="nosql", table=self.table)
-        except v3f.errors.WriteError:
-            return False, None
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to complete check for message" f"in kv with {e}"
-            )
-        if message_id in df.index.tolist():
+        """
+        Check to see if an entry with the specified Azure Service Bus
+        If the message_id is present, return True, and the attributes
+        from the key-value store
+        
+        :param message_id: The message to be interrogated
+        :returns A tuple of True/False and if True, the k,v run status
+            from the table
+        
+        """
+        query = f"message_id == '{message_id}'"
+        logging.info(f"is message_id:  {message_id} in kv store?")
+        response = self.v3io_client.kv.scan(
+            container=self.v3io_container,
+            table_path=self.table,
+            filter_expression = query,
+        )
+        items = response.output.items
+
+        if not items:
+            logging.info("message_id not in the kv store")
+            return False, items
+        elif len(items) == 1:
+            item = items[0]
             logging.info("message_id is in kv store")
-            df = df[df.index == message_id]
-            return True, df
+            return True, item
         else:
-            return False, None
+            raise ValueError("Found duplicate entries by message_id in k,v store!")
 
     def update_kv_data(self, message, action=None):
         """ Add the Service Bus message to the kv table"""
+
         try:
-            if action in ["update_entry", "delete_entry"]:
-                # Remove the entry
-                filter = f"message_id=='{message.get('message_id')}'"
-                self.v3io_client.delete(backend="kv", table=self.table, filter=filter)
-            if action == "delete_entry":
-                return
-            logging.info("Adding message to kv...")
-            df = pd.DataFrame.from_dict(data=message, orient="index").T
-            logging.info("Message converted to DataFrame")
-            df = df.set_index("message_id")
-            self.v3io_client.write(backend="nosql", table=self.table, dfs=df)
+            if action in ["create_entry", "update_entry", "delete_entry"]:
+                if action == "create_entry":
+                    logging.info("Adding record")
+                    for item_key, item_attributes in message.items():
+                        self.v3io_client.kv.put(container=self.v3io_container,
+                                                table_path = self.table,
+                                                key = item_key,
+                                                attributes = item_attributes
+                                               )
+                elif action == "update_entry":
+                    logging.info("Updating record")
+                    for item_key, item_attributes in message.items():
+                        self.v3io_client.kv.update(
+                            container = self.v3io_container,
+                            table_path=self.table,
+                            key = item_key,
+                            attributes = item_attributes
+                        )
+                elif action == "delete_entry":
+                    logging.info("Removing record")
+                    for item_key, item_attributes in message.items():
+                        self.v3io_client.kv.delete(
+                        container = self.v3io_container,
+                        table_path = self.table,
+                        key = item_key,
+                        )
+                else:
+                    raise ValueError("Value passed to update_kv_data unknown!")
+
         except Exception as e:
             raise RuntimeError(f"Failed to add message to kv for {e}")
 
@@ -303,17 +350,41 @@ class AzureSBToMLRun:
         abfs_path = f"az://{path}"
         return account_name, abfs_path
 
+    def count_running_pipelines(self):
+        """
+        Get a count of the pipelines in KV that are in a running
+        or started state
+        """
+        query = "run_status in ('Started', 'Running')"
+
+        response = self.v3io_client.kv.scan(
+            container=self.v3io_container, table_path=self.table, filter_expression=query
+        )
+        items = response.output.items
+        return len(items)
+        
+
     def get_run_status(self, workflow_id):
         """
         Retrieves the status of a pipeline run from the mlrun database
 
         :param workflow_id: A workflow_id from the mlrun database
-        :return The run status of a pipeline
+        :return A tuple of the run status of a pipeline, and the pipeline start timestamp
         """
-
-        db = get_run_db().connect()
-        pipeline_info = db.get_pipeline(run_id=workflow_id)
-        return pipeline_info.get("run").get("status")
+        try:
+            db = get_run_db().connect()
+            pipeline_info = db.get_pipeline(run_id=workflow_id)
+            run_status = pipeline_info.get("run").get("status") or "none"
+            data = json.loads(pipeline_info.get("pipeline_runtime").get("workflow_manifest"))
+            run_start_ts = data.get("status").get("startedAt")
+            if run_start_ts is None:
+                run_start_ts = "null"
+            else:
+                run_start_ts = datetime.strptime(run_start_ts, "%Y-%m-%dT%H:%M:%SZ")
+            
+            return run_status, run_start_ts
+        except Exception as e:
+            raise RuntimeError(f"Failed to get_run_status for {e}")
 
     def process_message(self, message):
         """
@@ -322,139 +393,180 @@ class AzureSBToMLRun:
         :param message: A Python dict of the message received from
             Azure Service Bus
         """
-        logging.info("Process the incoming message")
+        logging.info("Process the incoming message, example follows:")
+        logging.info(message)
         message_id = message.get("id", None)
         if message_id is None:
             raise ValueError("Unable to identify message_id!")
-        message_topic = message.get("topic", None)
-        event_type = message.get("eventType", None)
-        data = message.get("data", None)
-        if data is not None:
-            blob_url = data.get("blobUrl", None)
+        message_topic = message.get("topic", "none")
+        event_type = message.get("eventType", "none")
+        event_time = message.get("eventTime")
+        data = message.get("data", "none")
+        if data is not "none":
+            blob_url = data.get("blobUrl", "none")
             # Reformat the blob_url to a fsspec-compatible file location
             abfs_account, abfs_path = self._parse_blob_url_to_fsspec_path(blob_url)
 
         processed_message = {
-            "message_id": message_id,  # The messageId from Service Bus
-            "message_topic": message_topic,  # messageTopic from Service Bus
-            "event_type": event_type,  # The eventType from Service Bus
-            "blob_url": blob_url,  # The blobUrl -- The blob created
-            "workflow_id": None,  # This is the workflow_id set by mlrun
-            "run_status": None,  # This is the run_status in Iguazio
-            #                             "run_attempts": 0,
-            # We will zero-index count the number of run attempts for
-            # a given run
-            "abfs_account_name": abfs_account or None,
-            "abfs_path": abfs_path or None,
+            message_id: # The messageId from Service Bus
+                {"message_topic": message_topic,  # messageTopic from Service Bus
+                "event_type": event_type,  # The eventType from Service Bus
+                 "event_time": event_time, # The eventTime from service Bus
+                "blob_url": blob_url,  # The blobUrl -- The blob created
+                "workflow_id": "none",  # This is the workflow_id set by mlrun
+                "run_status": "none",  # This is the run_status in Iguazio
+                "run_attempts": 0,  # zero-index count the number of run attempts
+                "abfs_account_name": abfs_account or "none",
+                "abfs_path": abfs_path or "none",
+                 "run_start_timestamp": "null",
+                }
         }
 
         # Check to see if the message_id is in the nosql run table
-        has_message, df = self.check_kv_for_message(message_id)
+        has_message, existing_kv_entry = self.check_kv_for_message(message_id)
         if not has_message:
             # If the message_id is not in the k,v store, Add it
-            # to the store and run the pipeline, returning the
-            # workflow_id and the run_status
+            # to the store
             logging.info("message_id not found in kv store")
-            self.update_kv_data(processed_message)
-            workflow_id = self.run_pipeline(event=processed_message)
-            run_status = "Started"
-            logging.info(f"workflow_id is:  {workflow_id}")
-            if workflow_id is not None:
-                # Here we're starting the pipeline and adding the workflow_id
-                # to the kv store
-                logging.info(f"workflow_id is:  {workflow_id}")
-                processed_message["workflow_id"] = workflow_id
-                processed_message["run_status"] = run_status
-                self.update_kv_data(processed_message, action="update_entry")
-        else:
-            logging.info(
-                "Found message_id in the kv store.  Check to see if the "
-                "pipeline is running or has run"
-            )
-            run_status = df.squeeze()["run_status"]
-            if run_status in [None, "Failed"]:
+            self.update_kv_data(processed_message, action="create_entry")
+            # Check to see if the number of running pipelines exceeds the allowable
+            # concurrent pipelines.
+            num_running_pipelines = self.count_running_pipelines()
+            logging.info(f"There are {num_running_pipelines} returned from kv")
+            if num_running_pipelines < self.max_concurrent_pipelines:
                 workflow_id = self.run_pipeline(event=processed_message)
                 run_status = "Started"
-                processed_message["workflow_id"] = workflow_id
-                processed_message["run_status"] = run_status
-                self.update_kv_data(processed_message, action="update_entry")
-            elif run_status == "Running":
-                pass
-            else:
-                logging.info(f"run_status unknown:  {run_status}")
+                logging.info(f"workflow_id is:  {workflow_id}")
+                if workflow_id is not "none":
+                    # Here we're starting the pipeline and adding the workflow_id
+                    # to the kv store
+                    logging.info(f"workflow_id is:  {workflow_id}")
+                    processed_message[message_id]["workflow_id"] = workflow_id
+                    processed_message[message_id]["run_status"] = run_status
+            self.update_kv_data(processed_message, action="update_entry")
+            logging.info("Sleeping")
+            time.sleep(20)
+#         else:
+#             logging.info(
+#                 "Found message_id in the kv store.  Check to see if the "
+#                 "pipeline is running or has run"
+#             )
+#             run_status = existing_kv_entry[message_id]["run_status"]
+#             if run_status in ["none", "Failed"]:
+#                 workflow_id = self.run_pipeline(event=existing_kv_entry)
+#                 run_status = "Started"
+#                 existing_kv_entry[message_id]["workflow_id"] = workflow_id
+#                 existing_kv_entry[message_id]["run_status"] = run_status
+#                 self.update_kv_data(existing_kv_entry, action="update_entry")
+#             elif run_status == "Running":
+#                 pass
+#             else:
+#                 logging.info(f"run_status unknown:  {run_status}")
 
-    def check_and_update_run_status(self):
+    def check_and_update_run_status(self, ttl: int = 4):
         """
         This will be run in the Nuclio handler on a CRON trigger.
         We will retrieve a list of active runs from the KV store and
         check their status.  We can update the kv store if a run is done.
+
+        :param ttl: Amount of time, in hours, to allow a run to remain in a running
+            state before sending a kill signal
         """
 
         # Find any entries in the kv store with no status or in a running state
-        logging.info("Set counter to zero")
-        counter = 0
         query = "run_status in ('Started', 'Running')"
 
-        while counter < 3:
-            try:
-                df = self.v3io_client.read(
-                    backend="nosql", table=self.table, filter=query
-                )
-                if len(df.index) > 0:
-                    # If there are runs in the kv store that are in a started
-                    # or running state, check their run_status
-                    # Handle retry logic where a run can be attempted up to 3
-                    # times on the same day.
+        # And calculate the current time, so we can decide how to handle
+        # long-running jobs and if we should ignore old runs
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ttl = ttl*3600   # Convert hours to seconds
+        
 
-                    for workflow_id in df["workflow_id"].tolist():
-                        logging.info(
-                            f"Checking run info for workflow_id:" f"{workflow_id}"
-                        )
-                        current_run_info = (
-                            df[df["workflow_id"] == workflow_id]
-                            .reset_index()
-                            .to_dict("records")[0]
-                        )
+        # Get the count of running pipelines in the KV store
+        # as well as the pipelines in KV that are logged as in progress
+        num_running_pipelines = self.count_running_pipelines()
+        logging.info(f"How many running pipelines were found:  {num_running_pipelines}")
+        try:
+            response = self.v3io_client.kv.scan(
+                container=self.v3io_container, table_path=self.table, filter_expression=query
+            )
+            items = response.output.items
+            if items:
+                # If there are runs in the kv store that are in a started
+                # or running state, check their run_status
 
-                        run_status = self.get_ppeline_status(workflow_id)
-                        if run_status == "Succeeded":
-                            logging.info("run_status is 'Succeeded'")
-                            current_run_info["run_status"] = run_status
-                            self.update_kv_data(current_run_info, action="update_entry")
-                        elif (
-                            run_status == "Failed"
-                        ):  # and current_run_info["run_attempts"] < 3:
-                            logging.info(
-                                "Run status in a failed state."
-                                "Need to implement logic to retry!"
-                            )
-                            #   current_run_info["run_attempts"] += 1
-                            #   workflow_id = self.run_pipeline
-                            # (current_run_info)
-                            #    run_status = self.get_run_status(workflow_id)
-                            #   current_run_info["workflow_id"] = workflow_id
-                            #   current_run_info["run_status"] = run_status
-                            # self.update_kv_data(current_run_info, action =
-                            # "update_entry")
-                            pass
-                        elif run_status in ["Started", "Running"]:
-                            logging.info("Run is in progress...")
-                            pass
-                        elif run_status is None:
-                            logging.info("run_status has a None state.")
-                        else:
-                            logging.info(
-                                f"run_status is not known."
-                                f"Got a run_status of {run_status}"
-                            )
-                else:
+                for item in items:
+                    logging.info(item)
+                    new_item = {}
+                    workflow_id = item['workflow_id']
+                    message_id = item.pop('__name')
+                    new_item[message_id] = item
                     logging.info(
-                        "No runs found in kv store that match"
-                        "'Started' or 'Running' state."
+                        f"Checking run info for workflow_id:" f"{workflow_id}"
                     )
-            except Exception as e:
-                logging.info(f"Caught exception {e}." "Update counter retry!")
-                counter += 1
-                time.sleep(10)
-                continue
-            break
+
+                    # Get the latest run status for the workflow_id from the mlrun database
+                    # and update it here.
+                    run_status, run_start_ts = self.get_run_status(workflow_id)
+                    new_item[message_id]["run_status"] = run_status
+                    new_item[message_id]["run_start_timestamp"] = run_start_ts
+                    if run_status == "Succeeded":
+                        logging.info("run_status is 'Succeeded'")
+                        pass
+                    elif (
+                        run_status in ["Failed", "none"]
+                    ) and (num_running_pipelines <= self.max_concurrent_pipelines):  # and current_run_info["run_attempts"] < 3:
+                        logging.info(
+                            "Run status in a Failed or none state."
+                            "Retry the pipeline!"
+                        )
+                        if run_status == "Failed":
+                            new_item[message_id]["run_attempts"] += 1
+                        workflow_id = self.run_pipeline(new_item)
+                        run_status, run_start_ts = self.get_run_status(workflow_id)
+                        new_item[message_id]["workflow_id"] = workflow_id
+                        new_item[message_id]["run_status"] = run_status
+                        new_item[message_id]["run_start_timestamp"] = run_start_ts
+                    elif run_status in ["Running", "Started"]:
+                        logging.info("KV shows run in progress.  Update status...")
+                        run_status, run_start_ts = self.get_run_status(workflow_id)
+                        # Check to see if the run has been going excessively long.
+                        # If so, kill the run and retry
+                        pipeline_runtime = (now - run_start_ts).seconds
+                        if pipeline_runtime > ttl:
+                            try:
+                                db = get_run_db.connect()
+                                db.abort_run(workflow_id)
+                            except Exception as e:
+                                logging.info("Failed to abort run")
+                        
+                        new_item[message_id]["run_attempts"] += 1
+                        if new_items[message_id]["run_attempts"] <= 3:
+                            db = get_run_db().connect()
+                            pipe = db.get_pipeline(run_id=workflow_id)
+                            pipe = json.loads(pipe['pipeline_runtime']['workflow_manifest'])
+                            uid = pipe['metadata']['uid']
+                            db.abort_run(uid, project=self.project)
+
+                    else:
+                        logging.info(
+                            f"run_status is not known."
+                            f"Got a run_status of {run_status}"
+                        )
+                    logging.info("Update record in kv")
+                    self.update_kv_data(new_item, action="update_entry")
+                    num_running_pipelines = self.count_running_pipelines()
+                    logging.info("Sleeping")
+                    time.sleep(10)
+            else:
+                logging.info(
+                    "No runs found in kv store that match"
+                    "'Started' or 'Running' state."
+                )
+
+        except Exception as e:
+            logging.info(f"Caught exception {e}." "Update counter retry!")
+            time.sleep(10)
+
+
+        

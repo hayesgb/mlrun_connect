@@ -107,6 +107,7 @@ class AzureSBToMLRun:
         connection_string=None,
         max_concurrent_pipelines=3,
         mlrun_project=None,
+        transport_kind=None,
     ):
         self.credential = credential
         self.namespace = namespace
@@ -138,7 +139,9 @@ class AzureSBToMLRun:
             and self.client_secret is not None
         ):
             self.credential = self._get_credential_from_service_principal()
-        self.v3io_client = v3io.dataplane.Client(max_connections=1)
+        self.v3io_client = v3io.dataplane.Client(
+            max_connections=1, transport_kind=transport_kind or "httpclient"
+        )
         self.tbl_init()
         self._listener_thread = Thread(target=self.do_connect, daemon=True)
         self._listener_thread.start()
@@ -184,23 +187,23 @@ class AzureSBToMLRun:
             self.v3io_client.create_schema(
                 container=self.v3io_container,
                 path=self.table,
-                key="message_id",
+                key="sb_message_id",
                 fields=[
-                    {"name": "message_id", "type": "string", "nullable": False},
-                    {"name": "message_topic", "type": "string", "nullable": True},
-                    {"name": "event_type", "type": "string", "nullable": True},
-                    {"name": "event_time", "type": "timestamp", "nullable": True},
-                    {"name": "blob_url", "type": "string", "nullable": True},
-                    {"name": "workflow_id", "type": "string", "nullable": True},
-                    {"name": "run_status", "type": "string", "nullable": True},
-                    {"name": "run_attempts", "type": "long", "nullable": False},
                     {"name": "abfs_account_name", "type": "string", "nullable": True},
                     {"name": "abfs_path", "type": "string", "nullable": True},
+                    {"name": "blob_url", "type": "string", "nullable": True},
+                    {"name": "run_attempts", "type": "long", "nullable": False},
                     {
                         "name": "run_start_timestamp",
                         "type": "timestamp",
                         "nullable": True,
                     },
+                    {"name": "run_status", "type": "string", "nullable": True},
+                    {"name": "sb_event_time", "type": "timestamp", "nullable": True},
+                    {"name": "sb_event_type", "type": "string", "nullable": True},
+                    {"name": "sb_message_id", "type": "string", "nullable": False},
+                    {"name": "sb_message_topic", "type": "string", "nullable": True},
+                    {"name": "workflow_id", "type": "string", "nullable": True},
                 ],
             )
         else:
@@ -221,7 +224,10 @@ class AzureSBToMLRun:
                         try:
                             logging.info("get message")
                             message = json.loads(str(msg))
-                            self.process_message(message)
+                            # Parse the message from Service Bus into a usable format
+                            parsed_message = self.parse_servicebus_message(message)
+                            # Add the message to the kv store and start a pipeline
+                            self.process_message(parsed_message)
                             should_complete = True
                         except Exception as e:
                             logging.info(
@@ -396,41 +402,55 @@ class AzureSBToMLRun:
         except Exception as e:
             raise RuntimeError(f"Failed to get_run_status for {e}")
 
-    def process_message(self, message):
+    def parse_servicebus_message(self, message):
         """
         Write the logic here to parse the incoming message.
 
         :param message: A Python dict of the message received from
             Azure Service Bus
+        :returns A nested Python dict with information information from the
+            Service Bus message for handling a pipeline run, and for tracking
+            that run as it flows through the pipeline.
         """
-        logging.info("Process the incoming message, example follows:")
-        logging.info(message)
+        logging.info("Process the incoming message.")
+        # logging.info(message)
         message_id = message.get("id", None)
         if message_id is None:
             raise ValueError("Unable to identify message_id!")
-        message_topic = message.get("topic", "none")
-        event_type = message.get("eventType", "none")
-        event_time = message.get("eventTime")
-        data = message.get("data", "none")
+        message_topic = message.get("messageTopic", "null")
+        event_type = message.get("eventType", "null")
+        event_time = message.get("eventTime", "null")
+        data = message.get("data", "null")
         if data != "none":
-            blob_url = data.get("blobUrl", "none")
+            blob_url = data.get("blobUrl", "null")
             # Reformat the blob_url to a fsspec-compatible file location
             abfs_account, abfs_path = self._parse_blob_url_to_fsspec_path(blob_url)
 
-        processed_message = {
+        parsed_message = {
             message_id: {  # The messageId from Service Bus
-                "message_topic": message_topic,  # messageTopic from Service Bus
-                "event_type": event_type,  # The eventType from Service Bus
-                "event_time": event_time,  # The eventTime from service Bus
+                "sb_message_topic": message_topic,  # messageTopic from Service Bus
+                "sb_event_type": event_type,  # The eventType from Service Bus
+                "sb_event_time": event_time,  # The eventTime from service Bus
                 "blob_url": blob_url,  # The blobUrl -- The blob created
-                "workflow_id": "none",  # This is the workflow_id set by mlrun
-                "run_status": "none",  # This is the run_status in Iguazio
+                "workflow_id": "null",  # This is the workflow_id set by mlrun
+                "run_status": "null",  # This is the run_status in Iguazio
                 "run_attempts": 0,  # zero-index count the number of run attempts
-                "abfs_account_name": abfs_account or "none",
-                "abfs_path": abfs_path or "none",
+                "abfs_account_name": abfs_account or "null",
+                "abfs_path": abfs_path or "null",
                 "run_start_timestamp": "null",
             }
         }
+
+        return parsed_message
+
+    def process_message(self, message):
+        """
+        Write the logic here to process the parsed message.  Validate it is not present
+        in the KV store, and start a Kubeflow Pipeline
+
+        :param message: A Python dict of the parsed message from Azure Service Bus
+        """
+        message_id = list(message.keys())[0]
 
         # Check to see if the message_id is in the nosql run table
         has_message, existing_kv_entry = self.check_kv_for_message(message_id)
@@ -438,22 +458,22 @@ class AzureSBToMLRun:
             # If the message_id is not in the k,v store, Add it
             # to the store
             logging.info("message_id not found in kv store")
-            self.update_kv_data(processed_message, action="create_entry")
+            self.update_kv_data(message, action="create_entry")
             # Check to see if the number of running pipelines exceeds the allowable
             # concurrent pipelines.
             num_running_pipelines = self.count_running_pipelines()
             logging.info(f"There are {num_running_pipelines} returned from kv")
             if num_running_pipelines < self.max_concurrent_pipelines:
-                workflow_id = self.run_pipeline(event=processed_message)
+                workflow_id = self.run_pipeline(event=message)
                 run_status = "Started"
                 logging.info(f"workflow_id is:  {workflow_id}")
                 if workflow_id != "none":
                     # Here we're starting the pipeline and adding the workflow_id
                     # to the kv store
                     logging.info(f"workflow_id is:  {workflow_id}")
-                    processed_message[message_id]["workflow_id"] = workflow_id
-                    processed_message[message_id]["run_status"] = run_status
-            self.update_kv_data(processed_message, action="update_entry")
+                    message[message_id]["workflow_id"] = workflow_id
+                    message[message_id]["run_status"] = run_status
+            self.update_kv_data(message, action="update_entry")
             logging.info("Sleeping")
             time.sleep(20)
 
